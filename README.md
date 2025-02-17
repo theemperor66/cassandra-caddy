@@ -1,2 +1,2 @@
 # cassandra-caddy
-A plugin to provide config through cassandra
+A Caddy Config Plugin for using Cassandra
