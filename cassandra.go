@@ -1,4 +1,4 @@
-package cassandracfg
+package cassandra_caddy
 
 import (
 	"encoding/json"
