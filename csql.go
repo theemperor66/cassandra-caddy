@@ -15,12 +15,11 @@ import (
 
 // ConfigEntry represents a row in the caddy_config table
 type ConfigEntry struct {
-	ConfigID    gocql.UUID `json:"-"`
-	Path        string     `json:"path"`
-	Value       string     `json:"value"`
-	DataType    string     `json:"data_type"`
-	Enabled     bool       `json:"enabled"`
-	LastUpdated time.Time  `json:"last_updated"`
+	Path        string    `json:"path"`
+	Value       string    `json:"value"`
+	DataType    string    `json:"data_type"`
+	Enabled     bool      `json:"enabled"`
+	LastUpdated time.Time `json:"last_updated"`
 }
 
 func init() {
@@ -32,7 +31,6 @@ type CassandraAdapterConfig struct {
 	Hosts        []string `json:"contact_points"`
 	Keyspace     string   `json:"keyspace"`
 	QueryTimeout int      `json:"query_timeout"`
-	ConfigID     string   `json:"config_id"` // UUID string for the config to load
 }
 
 var (
@@ -47,10 +45,6 @@ var (
 	}
 
 	arrayPaths = map[string]bool{
-		"apps.http.servers.*.routes":                true,
-		"apps.http.servers.*.routes.*.match":        true,
-		"apps.http.servers.*.routes.*.handle":       true,
-		"apps.http.servers.*.listen":                true,
 		"apps.http.servers.*.routes.*.match.*.host": true,
 	}
 )
@@ -201,13 +195,13 @@ func setNestedValue(currentMap map[string]interface{}, path []string, value inte
 }
 
 // getConfiguration retrieves and builds the configuration from Cassandra
-func getConfiguration(session *gocql.Session, configID gocql.UUID) (map[string]interface{}, error) {
+func getConfiguration(session *gocql.Session) (map[string]interface{}, error) {
 	config := make(map[string]interface{})
 	iter := session.Query(`
 		SELECT path, value, data_type 
 		FROM caddy_config 
-		WHERE config_id = ? AND enabled = true 
-		ALLOW FILTERING`, configID).Iter()
+		WHERE enabled = true 
+		ALLOW FILTERING`).Iter()
 
 	var entry ConfigEntry
 	for iter.Scan(&entry.Path, &entry.Value, &entry.DataType) {
@@ -238,18 +232,13 @@ func (a Adapter) Adapt(body []byte, options map[string]interface{}) ([]byte, []c
 		return nil, nil, fmt.Errorf("contact_points and keyspace are required")
 	}
 
-	configID, err := gocql.ParseUUID(config.ConfigID)
-	if err != nil {
-		return nil, nil, fmt.Errorf("invalid config_id: %w", err)
-	}
-
 	session, err := getSession(config)
 	if err != nil {
 		return nil, nil, err
 	}
 	defer session.Close()
 
-	caddyConfig, err := getConfiguration(session, configID)
+	caddyConfig, err := getConfiguration(session)
 	if err != nil {
 		return nil, nil, err
 	}
