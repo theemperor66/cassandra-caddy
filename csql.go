@@ -1,8 +1,10 @@
-package cassandra_caddy
+package cassandraadapter
 
 import (
 	"encoding/json"
 	"fmt"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/caddyserver/caddy/v2"
@@ -10,201 +12,198 @@ import (
 	"github.com/gocql/gocql"
 )
 
+// ConfigEntry represents a row in the caddy_config table
+type ConfigEntry struct {
+	ConfigID    gocql.UUID `json:"-"`
+	Path        string     `json:"path"`
+	Value       string     `json:"value"`
+	DataType    string     `json:"data_type"`
+	Enabled     bool       `json:"enabled"`
+	LastUpdated time.Time  `json:"last_updated"`
+}
+
 func init() {
-	caddyconfig.RegisterAdapter("cassandra", Adapter{})
+	caddyconfig.RegisterAdapter("cql", Adapter{})
 }
 
 type CassandraAdapterConfig struct {
-	Hosts           []string `json:"hosts"`
-	Keyspace        string   `json:"keyspace"`
-	TableNamePrefix string   `json:"tableNamePrefix"`
-	RefreshInterval int64    `json:"refreshInterval"`
-	Username        string   `json:"username,omitempty"`
-	Password        string   `json:"password,omitempty"`
+	Hosts        []string `json:"contact_points"`
+	Keyspace     string   `json:"keyspace"`
+	QueryTimeout int      `json:"query_timeout"`
+	LockTimeout  int      `json:"lock_timeout"`
+	ConfigID     string   `json:"config_id"` // UUID string for the config to load
 }
 
 var session *gocql.Session
-var tableName string
-var config_version = "0"
 
 type Adapter struct{}
 
-func getSession(cassandraConfig CassandraAdapterConfig) (*gocql.Session, error) {
+func getSession(config CassandraAdapterConfig) (*gocql.Session, error) {
 	if session == nil {
-		cluster := gocql.NewCluster(cassandraConfig.Hosts...)
-		cluster.Keyspace = cassandraConfig.Keyspace
-		if cassandraConfig.Username != "" && cassandraConfig.Password != "" {
-			cluster.Authenticator = gocql.PasswordAuthenticator{
-				Username: cassandraConfig.Username,
-				Password: cassandraConfig.Password,
-			}
-		}
+		cluster := gocql.NewCluster(config.Hosts...)
+		cluster.Keyspace = config.Keyspace
+		cluster.Timeout = time.Duration(config.QueryTimeout) * time.Second
 
 		var err error
 		session, err = cluster.CreateSession()
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("failed to create session: %w", err)
 		}
 
-		tableName = cassandraConfig.TableNamePrefix + "_CONFIG"
-
 		// Create table if not exists
-		createTableQuery := fmt.Sprintf(`
-			CREATE TABLE IF NOT EXISTS %s (
-				id timeuuid,
-				key text,
+		createTableQuery := `
+			CREATE TABLE IF NOT EXISTS caddy_config (
+				config_id uuid,
+				path text,
 				value text,
-				enable boolean,
-				created timestamp,
-				PRIMARY KEY (key, created)
-			) WITH CLUSTERING ORDER BY (created DESC)
-		`, tableName)
+				data_type text,
+				enabled boolean,
+				last_updated timestamp,
+				PRIMARY KEY (config_id, path)
+			)`
 
 		if err := session.Query(createTableQuery).Exec(); err != nil {
-			caddy.Log().Named("adapters.cassandra.config").Error(fmt.Sprintf("Create Table Error: %v", err))
+			caddy.Log().Named("adapters.cql").Error(fmt.Sprintf("Create Table Error: %v", err))
 			return nil, err
 		}
 	}
 	return session, nil
 }
 
-func getValueFromDb(key string) (string, error) {
-	var value string
-	err := session.Query(`SELECT value FROM `+tableName+` WHERE key = ? AND enable = true LIMIT 1`, key).Scan(&value)
-	if err == gocql.ErrNotFound {
-		return "", nil
-	}
-	return value, err
-}
-
-func getValuesFromDb(key string) ([]string, error) {
-	var values []string
-	iter := session.Query(`SELECT value FROM `+tableName+` WHERE key = ? AND enable = true`, key).Iter()
-	var value string
-	for iter.Scan(&value) {
-		values = append(values, value)
-	}
-	return values, iter.Close()
-}
-
-func getConfiguration() ([]byte, error) {
-	var value string
-	var err error
-
-	value, err = getValueFromDb("config")
-	if err != nil {
-		return nil, err
-	}
-
-	config := caddy.Config{}
-
-	if value != "" {
-		err = json.Unmarshal([]byte(value), &config)
-		if err != nil {
+// parseValue converts the string value to the appropriate Go type based on data_type
+func parseValue(value string, dataType string) (interface{}, error) {
+	switch dataType {
+	case "string":
+		// Remove any extra quotes that might be present
+		return strings.Trim(value, "\""), nil
+	case "number":
+		var num float64
+		if err := json.Unmarshal([]byte(value), &num); err != nil {
+			// Try parsing the raw string if JSON unmarshal fails
+			if n, err := json.Number(value).Float64(); err == nil {
+				return n, nil
+			}
 			return nil, err
 		}
-	}
-
-	// Load admin config
-	if value, err = getValueFromDb("config.admin"); err == nil && value != "" {
-		if config.Admin == nil {
-			configAdmin := &caddy.AdminConfig{}
-			err = json.Unmarshal([]byte(value), configAdmin)
-			config.Admin = configAdmin
-		} else {
-			err = json.Unmarshal([]byte(value), config.Admin)
+		return num, nil
+	case "boolean":
+		var b bool
+		if err := json.Unmarshal([]byte(value), &b); err != nil {
+			// Try parsing the raw string if JSON unmarshal fails
+			return value == "true", nil
 		}
-	}
-
-	// Similar pattern for other config sections...
-	// Load apps config
-	if value, err = getValueFromDb("config.apps"); err == nil && value != "" {
-		if config.AppsRaw == nil {
-			configAppsRaw := caddy.ModuleMap{}
-			err = json.Unmarshal([]byte(value), &configAppsRaw)
-			config.AppsRaw = configAppsRaw
-		} else {
-			err = json.Unmarshal([]byte(value), &config.AppsRaw)
+		return b, nil
+	case "array", "object":
+		var result interface{}
+		// Handle potential double-escaped JSON
+		unquoted, err := strconv.Unquote(value)
+		if err == nil {
+			value = unquoted
 		}
+		if err := json.Unmarshal([]byte(value), &result); err != nil {
+			return nil, fmt.Errorf("failed to parse JSON value: %w", err)
+		}
+		return result, nil
+	default:
+		return nil, fmt.Errorf("unknown data type: %s", dataType)
+	}
+}
+
+// setNestedValue recursively builds the configuration structure
+func setNestedValue(config map[string]interface{}, path []string, value interface{}) {
+	if len(path) == 1 {
+		config[path[0]] = value
+		return
 	}
 
-	return json.Marshal(config)
+	key := path[0]
+	if config[key] == nil {
+		config[key] = make(map[string]interface{})
+	}
+
+	if m, ok := config[key].(map[string]interface{}); ok {
+		setNestedValue(m, path[1:], value)
+	}
+}
+
+func getConfiguration(configID gocql.UUID) (map[string]interface{}, error) {
+	config := make(map[string]interface{})
+
+	// Query all enabled configuration entries for the given config_id
+	iter := session.Query(`
+		SELECT path, value, data_type 
+		FROM caddy_config 
+		WHERE config_id = ? AND enabled = true`, configID).Iter()
+
+	var entry ConfigEntry
+	for iter.Scan(&entry.Path, &entry.Value, &entry.DataType) {
+		// Parse the value according to its data type
+		parsedValue, err := parseValue(entry.Value, entry.DataType)
+		if err != nil {
+			return nil, fmt.Errorf("error parsing value for path %s: %w", entry.Path, err)
+		}
+
+		// Split the path and build the nested structure
+		pathParts := strings.Split(entry.Path, ".")
+
+		// Handle array indices in path correctly
+		for i, part := range pathParts {
+			if strings.HasPrefix(part, "[") && strings.HasSuffix(part, "]") {
+				// Convert array notation to regular path part
+				pathParts[i] = strings.Trim(part, "[]")
+			}
+		}
+
+		setNestedValue(config, pathParts, parsedValue)
+	}
+
+	if err := iter.Close(); err != nil {
+		return nil, fmt.Errorf("error fetching config: %w", err)
+	}
+
+	return config, nil
 }
 
 func (a Adapter) Adapt(body []byte, options map[string]interface{}) ([]byte, []caddyconfig.Warning, error) {
-	cassandraConfig := CassandraAdapterConfig{
-		TableNamePrefix: "CADDY",
-		RefreshInterval: 100,
+	// Parse the adapter configuration
+	config := CassandraAdapterConfig{
+		QueryTimeout: 60,
+		LockTimeout:  60,
 	}
 
-	err := json.Unmarshal(body, &cassandraConfig)
+	if err := json.Unmarshal(body, &config); err != nil {
+		return nil, nil, fmt.Errorf("failed to parse config: %w", err)
+	}
+
+	if len(config.Hosts) == 0 || config.Keyspace == "" {
+		return nil, nil, fmt.Errorf("hosts and keyspace are required")
+	}
+
+	// Parse the config_id
+	configID, err := gocql.ParseUUID(config.ConfigID)
+	if err != nil {
+		return nil, nil, fmt.Errorf("invalid config_id: %w", err)
+	}
+
+	// Get or create the session
+	session, err = getSession(config)
 	if err != nil {
 		return nil, nil, err
 	}
 
-	if len(cassandraConfig.Hosts) == 0 || cassandraConfig.Keyspace == "" {
-		caddy.Log().Named("adapters.cassandra.config").Error("Hosts or Keyspace not found")
-		panic("CassandraAdapter configuration incomplete")
-	}
-
-	session, err = getSession(cassandraConfig)
+	// Get the configuration
+	caddyConfig, err := getConfiguration(configID)
 	if err != nil {
 		return nil, nil, err
 	}
 
-	config, err := getConfiguration()
+	// Marshal the configuration to JSON
+	jsonData, err := json.Marshal(caddyConfig)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, fmt.Errorf("failed to marshal config: %w", err)
 	}
 
-	config_version_new := getConfigVersion()
-	config_version = config_version_new
-
-	runCheckLoop(cassandraConfig)
-	return config, nil, err
-}
-
-// Helper functions for version checking and config refresh
-func getConfigVersion() string {
-	var version string
-	err := session.Query(`SELECT value FROM `+tableName+` WHERE key = ? AND enable = true LIMIT 1`, "version").Scan(&version)
-	if err != nil {
-		caddy.Log().Named("adapters.cassandra.checkloop").Error(fmt.Sprintf("Error getting config version: %v", err))
-		return config_version
-	}
-	return version
-}
-
-func refreshConfig(config_version_new string) {
-	config, err := getConfiguration()
-	if err != nil {
-		caddy.Log().Named("adapters.cassandra.refreshConfig").Debug(fmt.Sprintf("err %v", err))
-		return
-	}
-	config_version = config_version_new
-	caddy.Load(config, false)
-}
-
-func checkAndRefreshConfig(cassandraConfig CassandraAdapterConfig) {
-	config_version_new := getConfigVersion()
-	if config_version_new != config_version {
-		refreshConfig(config_version_new)
-	}
-}
-
-func runCheckLoop(cassandraConfig CassandraAdapterConfig) {
-	done := make(chan bool)
-	go func(t time.Duration) {
-		tick := time.NewTicker(t).C
-		for {
-			select {
-			case <-tick:
-				checkAndRefreshConfig(cassandraConfig)
-			case <-done:
-				return
-			}
-		}
-	}(time.Second * time.Duration(cassandraConfig.RefreshInterval))
+	return jsonData, nil, nil
 }
 
 var _ caddyconfig.Adapter = (*Adapter)(nil)
