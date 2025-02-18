@@ -32,7 +32,6 @@ type CassandraAdapterConfig struct {
 	Hosts        []string `json:"contact_points"`
 	Keyspace     string   `json:"keyspace"`
 	QueryTimeout int      `json:"query_timeout"`
-	LockTimeout  int      `json:"lock_timeout"`
 	ConfigID     string   `json:"config_id"` // UUID string for the config to load
 }
 
