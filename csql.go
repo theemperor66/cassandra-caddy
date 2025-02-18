@@ -71,9 +71,9 @@ func getSession(config CassandraAdapterConfig) (*gocql.Session, error) {
 }
 
 // parseValue converts a string value to the appropriate Go type based on data_type.
-// For data_type "array", if the value is not valid JSON, it is wrapped in an array.
+// For data_type "array", if the value is not valid JSON, it is automatically wrapped in an array.
 func parseValue(value string, dataType string) (interface{}, error) {
-	// Attempt to unquote JSON strings (if the value is quoted).
+	// Attempt to unquote JSON strings (if quoted).
 	unquoted, unquoteErr := strconv.Unquote(value)
 	if unquoteErr == nil {
 		value = unquoted
@@ -82,6 +82,7 @@ func parseValue(value string, dataType string) (interface{}, error) {
 	switch dataType {
 	case "string":
 		return value, nil
+
 	case "number":
 		var num interface{}
 		if err := json.Unmarshal([]byte(value), &num); err != nil {
@@ -91,6 +92,7 @@ func parseValue(value string, dataType string) (interface{}, error) {
 			return nil, fmt.Errorf("invalid number value %q: %w", value, err)
 		}
 		return num, nil
+
 	case "boolean":
 		if value == "true" || value == "1" {
 			return true, nil
@@ -98,11 +100,12 @@ func parseValue(value string, dataType string) (interface{}, error) {
 			return false, nil
 		}
 		return nil, fmt.Errorf("invalid boolean value %q", value)
+
 	case "array":
 		var result interface{}
-		// First try to unmarshal as JSON.
+		// First, try to unmarshal as JSON.
 		if err := json.Unmarshal([]byte(value), &result); err != nil {
-			// If unmarshaling fails, assume it's a bare value and wrap it in an array.
+			// Log a warning and attempt to wrap the bare value in an array.
 			caddy.Log().Named("adapters.cql").Warn("Failed to unmarshal value as array; wrapping in array",
 				zap.String("value", value),
 				zap.Error(err))
@@ -113,12 +116,14 @@ func parseValue(value string, dataType string) (interface{}, error) {
 			return result, nil
 		}
 		return result, nil
+
 	case "object":
 		var result interface{}
 		if err := json.Unmarshal([]byte(value), &result); err != nil {
 			return nil, fmt.Errorf("failed to unmarshal JSON as object: %w", err)
 		}
 		return result, nil
+
 	default:
 		return nil, fmt.Errorf("unknown data type %q", dataType)
 	}
