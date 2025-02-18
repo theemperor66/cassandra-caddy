@@ -13,7 +13,7 @@ import (
 	"github.com/gocql/gocql"
 )
 
-// ConfigEntry represents a row in the caddy_config table
+// ConfigEntry represents a row in the caddy_config table.
 type ConfigEntry struct {
 	Path        string    `json:"path"`
 	Value       string    `json:"value"`
@@ -26,7 +26,7 @@ func init() {
 	caddyconfig.RegisterAdapter("cql", Adapter{})
 }
 
-// CassandraAdapterConfig holds the configuration for the Cassandra adapter
+// CassandraAdapterConfig holds the configuration for the Cassandra adapter.
 type CassandraAdapterConfig struct {
 	Hosts        []string `json:"contact_points"`
 	Keyspace     string   `json:"keyspace"`
@@ -34,6 +34,7 @@ type CassandraAdapterConfig struct {
 }
 
 var (
+	// arrayFields defines keys that should be interpreted as arrays.
 	arrayFields = map[string]bool{
 		"routes":         true,
 		"match":          true,
@@ -44,15 +45,16 @@ var (
 		"contact_points": true,
 	}
 
+	// arrayPaths is used to check specific patterns for array types.
 	arrayPaths = map[string]bool{
 		"apps.http.servers.*.routes.*.match.*.host": true,
 	}
 )
 
-// Adapter implements Caddy's config adapter interface for Cassandra
+// Adapter implements Caddy's config adapter interface for Cassandra.
 type Adapter struct{}
 
-// getSession creates a new Cassandra session based on the configuration
+// getSession creates a new Cassandra session based on the adapter configuration.
 func getSession(config CassandraAdapterConfig) (*gocql.Session, error) {
 	cluster := gocql.NewCluster(config.Hosts...)
 	cluster.Keyspace = config.Keyspace
@@ -60,14 +62,18 @@ func getSession(config CassandraAdapterConfig) (*gocql.Session, error) {
 
 	session, err := cluster.CreateSession()
 	if err != nil {
-		return nil, fmt.Errorf("failed to create session: %w", err)
+		return nil, fmt.Errorf("failed to create Cassandra session: %w", err)
 	}
+
+	caddy.Log().Named("adapters.cql").Info("Cassandra session established",
+		zap.Strings("hosts", config.Hosts),
+		zap.String("keyspace", config.Keyspace))
 	return session, nil
 }
 
-// parseValue converts a string value to the appropriate type based on data_type
+// parseValue converts a string value to the appropriate Go type based on data_type.
 func parseValue(value string, dataType string) (interface{}, error) {
-	// Attempt to unquote JSON strings
+	// Attempt to unquote JSON strings.
 	unquoted, unquoteErr := strconv.Unquote(value)
 	if unquoteErr == nil {
 		value = unquoted
@@ -76,17 +82,15 @@ func parseValue(value string, dataType string) (interface{}, error) {
 	switch dataType {
 	case "string":
 		return value, nil
-
 	case "number":
 		var num interface{}
 		if err := json.Unmarshal([]byte(value), &num); err != nil {
-			if n, err := strconv.ParseFloat(value, 64); err == nil {
+			if n, err2 := strconv.ParseFloat(value, 64); err2 == nil {
 				return n, nil
 			}
 			return nil, fmt.Errorf("invalid number value %q: %w", value, err)
 		}
 		return num, nil
-
 	case "boolean":
 		if value == "true" || value == "1" {
 			return true, nil
@@ -94,20 +98,18 @@ func parseValue(value string, dataType string) (interface{}, error) {
 			return false, nil
 		}
 		return nil, fmt.Errorf("invalid boolean value %q", value)
-
 	case "array", "object":
 		var result interface{}
 		if err := json.Unmarshal([]byte(value), &result); err != nil {
-			return nil, fmt.Errorf("failed to unmarshal JSON: %w", err)
+			return nil, fmt.Errorf("failed to unmarshal JSON for value %q: %w", value, err)
 		}
 		return result, nil
-
 	default:
 		return nil, fmt.Errorf("unknown data type %q", dataType)
 	}
 }
 
-// shouldBeArray determines if a path should be treated as an array
+// shouldBeArray returns true if a given path should be interpreted as an array.
 func shouldBeArray(path string) bool {
 	parts := strings.Split(path, ".")
 	if len(parts) > 0 {
@@ -115,7 +117,6 @@ func shouldBeArray(path string) bool {
 			return true
 		}
 	}
-
 	for pattern, isArray := range arrayPaths {
 		if isArray && matchWildcardPath(pattern, path) {
 			return true
@@ -124,15 +125,13 @@ func shouldBeArray(path string) bool {
 	return false
 }
 
-// matchWildcardPath checks if a path matches a pattern with wildcards
+// matchWildcardPath checks if a given path matches a pattern with wildcards.
 func matchWildcardPath(pattern, path string) bool {
 	patternParts := strings.Split(pattern, ".")
 	pathParts := strings.Split(path, ".")
-
 	if len(patternParts) != len(pathParts) {
 		return false
 	}
-
 	for i, p := range patternParts {
 		if p == "*" {
 			continue
@@ -144,13 +143,14 @@ func matchWildcardPath(pattern, path string) bool {
 	return true
 }
 
-// setNestedValue builds the configuration structure
+// setNestedValue recursively builds the configuration structure based on a dot-separated path.
 func setNestedValue(currentMap map[string]interface{}, path []string, value interface{}) {
 	if len(path) == 0 {
 		return
 	}
 
 	key := path[0]
+	// Base case: assign value at the final key.
 	if len(path) == 1 {
 		if shouldBeArray(strings.Join(path, ".")) {
 			if arr, ok := value.([]interface{}); ok {
@@ -164,7 +164,7 @@ func setNestedValue(currentMap map[string]interface{}, path []string, value inte
 		return
 	}
 
-	// Handle array indexes
+	// Check if the next part of the path is an array index.
 	if index, err := strconv.Atoi(path[1]); err == nil {
 		var arr []interface{}
 		if existing, ok := currentMap[key].([]interface{}); ok {
@@ -173,25 +173,30 @@ func setNestedValue(currentMap map[string]interface{}, path []string, value inte
 			arr = make([]interface{}, index+1)
 		}
 
-		// Expand array if needed, ensuring we add nil placeholders
+		// Expand the array if necessary.
 		for len(arr) <= index {
 			arr = append(arr, nil)
 		}
 
-		// If the element at the index is nil, initialize it as a new map
+		// Initialize the array element if it's nil.
 		if arr[index] == nil {
 			arr[index] = make(map[string]interface{})
 		}
 
-		// Now that arr[index] is guaranteed to be a map, set nested values
+		// Recursively set the nested value.
 		if elem, ok := arr[index].(map[string]interface{}); ok {
 			setNestedValue(elem, path[2:], value)
+		} else {
+			caddy.Log().Named("adapters.cql").Error("Unexpected type at array index",
+				zap.String("key", key),
+				zap.Int("index", index),
+				zap.Any("element", arr[index]))
 		}
 		currentMap[key] = arr
 		return
 	}
 
-	// Handle nested maps
+	// Otherwise, treat as a nested map.
 	if _, ok := currentMap[key].(map[string]interface{}); !ok {
 		currentMap[key] = make(map[string]interface{})
 	}
@@ -200,45 +205,55 @@ func setNestedValue(currentMap map[string]interface{}, path []string, value inte
 	}
 }
 
-// getConfiguration retrieves and builds the configuration from Cassandra
+// getConfiguration retrieves and assembles the configuration from Cassandra.
 func getConfiguration(session *gocql.Session) (map[string]interface{}, error) {
 	config := make(map[string]interface{})
-	iter := session.Query(`
+	query := `
 		SELECT path, value, data_type 
 		FROM caddy_config 
 		WHERE enabled = true 
-		ALLOW FILTERING`).Iter()
+		ALLOW FILTERING`
+	caddy.Log().Named("adapters.cql").Info("Running Cassandra query", zap.String("query", query))
+	iter := session.Query(query).Iter()
 
 	var path, value, dataType string
 	for iter.Scan(&path, &value, &dataType) {
+		caddy.Log().Named("adapters.cql").Debug("Processing row",
+			zap.String("path", path),
+			zap.String("value", value),
+			zap.String("data_type", dataType))
 		parsedValue, err := parseValue(value, dataType)
 		if err != nil {
-			caddy.Log().Named("adapters.cql").Error("parse error", zap.Error(err))
+			caddy.Log().Named("adapters.cql").Error("Error parsing value",
+				zap.String("path", path),
+				zap.String("value", value),
+				zap.String("data_type", dataType),
+				zap.Error(err))
 			continue
 		}
-
 		pathParts := strings.Split(path, ".")
 		setNestedValue(config, pathParts, parsedValue)
 	}
-
 	if err := iter.Close(); err != nil {
 		return nil, fmt.Errorf("query iteration failed: %w", err)
 	}
+
+	caddy.Log().Named("adapters.cql").Info("Successfully built configuration from Cassandra")
 	return config, nil
 }
 
-// Adapt converts Cassandra-stored configuration to Caddy JSON format
+// Adapt converts the Cassandra-stored configuration to Caddy's JSON format.
 func (a Adapter) Adapt(body []byte, options map[string]interface{}) ([]byte, []caddyconfig.Warning, error) {
-	var config CassandraAdapterConfig
-	if err := json.Unmarshal(body, &config); err != nil {
-		return nil, nil, fmt.Errorf("config unmarshal failed: %w", err)
+	var cfg CassandraAdapterConfig
+	if err := json.Unmarshal(body, &cfg); err != nil {
+		return nil, nil, fmt.Errorf("failed to unmarshal adapter configuration: %w", err)
+	}
+	if len(cfg.Hosts) == 0 || cfg.Keyspace == "" {
+		return nil, nil, fmt.Errorf("contact_points and keyspace are required in the adapter configuration")
 	}
 
-	if len(config.Hosts) == 0 || config.Keyspace == "" {
-		return nil, nil, fmt.Errorf("contact_points and keyspace are required")
-	}
-
-	session, err := getSession(config)
+	caddy.Log().Named("adapters.cql").Info("Adapter configuration loaded", zap.Any("config", cfg))
+	session, err := getSession(cfg)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -251,9 +266,10 @@ func (a Adapter) Adapt(body []byte, options map[string]interface{}) ([]byte, []c
 
 	jsonData, err := json.Marshal(caddyConfig)
 	if err != nil {
-		return nil, nil, fmt.Errorf("config marshal failed: %w", err)
+		return nil, nil, fmt.Errorf("failed to marshal final configuration to JSON: %w", err)
 	}
 
+	caddy.Log().Named("adapters.cql").Info("Final configuration JSON successfully generated")
 	return jsonData, nil, nil
 }
 
