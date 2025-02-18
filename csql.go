@@ -195,21 +195,23 @@ func matchWildcardPath(pattern, path string) bool {
 // setNestedValue recursively builds the configuration structure
 func setNestedValue(config map[string]interface{}, path []string, value interface{}) {
 	fullPath := strings.Join(path, ".")
+	caddy.Log().Named("adapters.cql").Debug(fmt.Sprintf("Setting nested value for path: %s", fullPath))
 
 	if len(path) == 1 {
 		key := path[0]
-		// Check if this field should be an array
 		if shouldBeArray(fullPath) {
-			// If it's an array field, ensure the value is an array
+			caddy.Log().Named("adapters.cql").Debug(fmt.Sprintf("Path %s should be an array", fullPath))
 			if arr, ok := value.([]interface{}); ok {
 				config[key] = arr
+				caddy.Log().Named("adapters.cql").Debug(fmt.Sprintf("Set array value for %s", fullPath))
 			} else {
-				// Convert single value to array if needed
 				config[key] = []interface{}{value}
+				caddy.Log().Named("adapters.cql").Debug(fmt.Sprintf("Wrapped single value in array for %s", fullPath))
 			}
 			return
 		}
 		config[key] = value
+		caddy.Log().Named("adapters.cql").Debug(fmt.Sprintf("Set regular value for %s", fullPath))
 		return
 	}
 
@@ -247,10 +249,17 @@ func setNestedValue(config map[string]interface{}, path []string, value interfac
 	}
 }
 
+// Add this struct to store path values
+type pathValue struct {
+	value    interface{}
+	dataType string
+}
+
 func getConfiguration(configID gocql.UUID) (map[string]interface{}, error) {
 	config := make(map[string]interface{})
 
-	// Modified query to include enabled in the SELECT and scan
+	caddy.Log().Named("adapters.cql").Debug(fmt.Sprintf("Starting configuration fetch for config_id: %s", configID))
+
 	iter := session.Query(`
 		SELECT path, value, data_type 
 		FROM caddy_config 
@@ -258,32 +267,78 @@ func getConfiguration(configID gocql.UUID) (map[string]interface{}, error) {
 		ALLOW FILTERING`, configID).Iter()
 
 	var entry ConfigEntry
+	pathValues := make(map[string]pathValue)
+
+	// First pass: collect all values
 	for iter.Scan(&entry.Path, &entry.Value, &entry.DataType) {
-		// Parse the value according to its data type
+		caddy.Log().Named("adapters.cql").Debug(fmt.Sprintf("Processing entry - Path: %s, Type: %s", entry.Path, entry.DataType))
+
 		parsedValue, err := parseValue(entry.Value, entry.DataType)
 		if err != nil {
+			caddy.Log().Named("adapters.cql").Error(fmt.Sprintf("Error parsing value for path %s: %v", entry.Path, err))
 			return nil, fmt.Errorf("error parsing value for path %s: %w", entry.Path, err)
 		}
 
-		// Split the path and build the nested structure
-		pathParts := strings.Split(entry.Path, ".")
+		// Log the parsed value
+		valueJSON, _ := json.Marshal(parsedValue)
+		caddy.Log().Named("adapters.cql").Debug(fmt.Sprintf("Parsed value for %s: %s", entry.Path, string(valueJSON)))
 
-		// Handle array indices in path correctly
-		for i, part := range pathParts {
-			if strings.HasPrefix(part, "[") && strings.HasSuffix(part, "]") {
-				// Convert array notation to regular path part
-				pathParts[i] = strings.Trim(part, "[]")
-			}
+		pathValues[entry.Path] = pathValue{
+			value:    parsedValue,
+			dataType: entry.DataType,
+		}
+	}
+
+	// Second pass: build structure ensuring arrays
+	for path, pv := range pathValues {
+		caddy.Log().Named("adapters.cql").Debug(fmt.Sprintf("Building structure for path: %s", path))
+
+		pathParts := strings.Split(path, ".")
+
+		// Special handling for routes paths
+		if strings.Contains(path, ".routes.") {
+			routesPath := path[:strings.Index(path, ".routes.")] + ".routes"
+			caddy.Log().Named("adapters.cql").Debug(fmt.Sprintf("Special handling for routes path: %s", routesPath))
+
+			baseConfig := make(map[string]interface{})
+			setNestedValue(baseConfig, strings.Split(routesPath, "."), []interface{}{})
+			setNestedValue(config, strings.Split(routesPath, "."), baseConfig[strings.Split(routesPath, ".")[0]])
 		}
 
-		setNestedValue(config, pathParts, parsedValue)
+		setNestedValue(config, pathParts, pv.value)
 	}
 
 	if err := iter.Close(); err != nil {
+		caddy.Log().Named("adapters.cql").Error(fmt.Sprintf("Error closing iterator: %v", err))
 		return nil, fmt.Errorf("error fetching config: %w", err)
 	}
 
+	// Final validation pass
+	caddy.Log().Named("adapters.cql").Debug("Starting final validation pass")
+	ensureArrays(config)
+
+	// Log final configuration
+	finalJSON, _ := json.MarshalIndent(config, "", "  ")
+	caddy.Log().Named("adapters.cql").Debug(fmt.Sprintf("Final configuration:\n%s", string(finalJSON)))
+
 	return config, nil
+}
+
+// Add this helper function
+func ensureArrays(m map[string]interface{}) {
+	for k, v := range m {
+		switch val := v.(type) {
+		case map[string]interface{}:
+			caddy.Log().Named("adapters.cql").Debug(fmt.Sprintf("Ensuring arrays for map key: %s", k))
+			ensureArrays(val)
+			if k == "routes" {
+				if _, ok := v.([]interface{}); !ok {
+					caddy.Log().Named("adapters.cql").Debug("Converting routes map to array")
+					m[k] = []interface{}{val}
+				}
+			}
+		}
+	}
 }
 
 func (a Adapter) Adapt(body []byte, options map[string]interface{}) ([]byte, []caddyconfig.Warning, error) {
