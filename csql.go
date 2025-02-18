@@ -169,10 +169,19 @@ func matchWildcardPath(pattern, path string) bool {
 	pathParts := strings.Split(path, ".")
 
 	if len(patternParts) != len(pathParts) {
-		return false
+		// Check if the pattern ends with ".*"
+		if strings.HasSuffix(pattern, ".*") && len(patternParts)-1 <= len(pathParts) {
+			// Trim the last "*" from pattern for comparison
+			patternParts = patternParts[:len(patternParts)-1]
+		} else {
+			return false
+		}
 	}
 
 	for i := range patternParts {
+		if i >= len(pathParts) {
+			return false
+		}
 		if patternParts[i] == "*" {
 			continue
 		}
