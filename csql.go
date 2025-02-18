@@ -129,14 +129,20 @@ func setNestedValue(config map[string]interface{}, path []string, value interfac
 func getConfiguration(configID gocql.UUID) (map[string]interface{}, error) {
 	config := make(map[string]interface{})
 
-	// Query all enabled configuration entries for the given config_id
+	// Modified query to only use the partition key (config_id)
 	iter := session.Query(`
 		SELECT path, value, data_type 
 		FROM caddy_config 
-		WHERE config_id = ? AND enabled = true`, configID).Iter()
+		WHERE config_id = ?`, configID).Iter()
 
 	var entry ConfigEntry
 	for iter.Scan(&entry.Path, &entry.Value, &entry.DataType) {
+		// Only process enabled entries in memory instead of in the query
+		// This avoids the ALLOW FILTERING requirement
+		if !entry.Enabled {
+			continue
+		}
+
 		// Parse the value according to its data type
 		parsedValue, err := parseValue(entry.Value, entry.DataType)
 		if err != nil {
