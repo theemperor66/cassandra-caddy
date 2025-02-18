@@ -173,11 +173,17 @@ func setNestedValue(currentMap map[string]interface{}, path []string, value inte
 			arr = make([]interface{}, index+1)
 		}
 
-		// Expand array if needed
+		// Expand array if needed, ensuring we add nil placeholders
 		for len(arr) <= index {
-			arr = append(arr, make(map[string]interface{}))
+			arr = append(arr, nil)
 		}
 
+		// If the element at the index is nil, initialize it as a new map
+		if arr[index] == nil {
+			arr[index] = make(map[string]interface{})
+		}
+
+		// Now that arr[index] is guaranteed to be a map, set nested values
 		if elem, ok := arr[index].(map[string]interface{}); ok {
 			setNestedValue(elem, path[2:], value)
 		}
