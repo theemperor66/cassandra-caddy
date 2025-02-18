@@ -268,12 +268,13 @@ func isRoutePath(path string) bool {
 	return false
 }
 
-// Update getConfiguration to better handle routes
+// Update getConfiguration to be simpler and more direct
 func getConfiguration(configID gocql.UUID) (map[string]interface{}, error) {
 	config := make(map[string]interface{})
 
 	caddy.Log().Named("adapters.cql").Debug(fmt.Sprintf("Starting configuration fetch for config_id: %s", configID))
 
+	// First, get all entries
 	iter := session.Query(`
 		SELECT path, value, data_type 
 		FROM caddy_config 
@@ -281,9 +282,9 @@ func getConfiguration(configID gocql.UUID) (map[string]interface{}, error) {
 		ALLOW FILTERING`, configID).Iter()
 
 	var entry ConfigEntry
-	routeConfigs := make(map[string][]interface{}) // Store route configurations by server path
+	routes := make(map[string][]interface{}) // map[serverPath][]routes
 
-	// First pass: collect routes and regular values
+	// Process each entry
 	for iter.Scan(&entry.Path, &entry.Value, &entry.DataType) {
 		caddy.Log().Named("adapters.cql").Debug(fmt.Sprintf("Processing entry - Path: %s, Type: %s", entry.Path, entry.DataType))
 
@@ -293,56 +294,66 @@ func getConfiguration(configID gocql.UUID) (map[string]interface{}, error) {
 			return nil, fmt.Errorf("error parsing value for path %s: %w", entry.Path, err)
 		}
 
-		pathParts := strings.Split(entry.Path, ".")
+		// Check if this is a route entry
+		if strings.Contains(entry.Path, ".routes.") {
+			parts := strings.Split(entry.Path, ".routes.")
+			if len(parts) != 2 {
+				continue
+			}
 
-		if isRoutePath(entry.Path) {
-			// Handle route entry
-			serverPath := entry.Path[:strings.Index(entry.Path, ".routes")]
-			routeIdx, _ := strconv.Atoi(pathParts[len(pathParts)-2]) // Get route index
+			serverPath := parts[0]
+			routePath := parts[1]
+			routeParts := strings.Split(routePath, ".")
 
-			// Initialize route array if needed
-			if routeConfigs[serverPath] == nil {
-				routeConfigs[serverPath] = make([]interface{}, 0)
+			// Get route index
+			routeIndex, err := strconv.Atoi(routeParts[0])
+			if err != nil {
+				continue
+			}
+
+			// Initialize routes array if needed
+			if routes[serverPath] == nil {
+				routes[serverPath] = make([]interface{}, 0)
 			}
 
 			// Ensure route array is long enough
-			for len(routeConfigs[serverPath]) <= routeIdx {
-				routeConfigs[serverPath] = append(routeConfigs[serverPath], make(map[string]interface{}))
+			for len(routes[serverPath]) <= routeIndex {
+				routes[serverPath] = append(routes[serverPath], make(map[string]interface{}))
 			}
 
-			// Get the route object
-			route := routeConfigs[serverPath][routeIdx].(map[string]interface{})
-
-			// Set the value in the route
-			setNestedValue(route, pathParts[len(pathParts)-1:], parsedValue)
-			routeConfigs[serverPath][routeIdx] = route
+			// Get the route object and set the value
+			route := routes[serverPath][routeIndex].(map[string]interface{})
+			remaining := routeParts[1:]
+			if len(remaining) > 0 {
+				setNestedValue(route, remaining, parsedValue)
+				routes[serverPath][routeIndex] = route
+			}
 		} else {
-			// Handle non-route entry
-			setNestedValue(config, pathParts, parsedValue)
+			// Regular (non-route) entry
+			setNestedValue(config, strings.Split(entry.Path, "."), parsedValue)
 		}
-	}
-
-	// Second pass: insert route arrays into config
-	for serverPath, routes := range routeConfigs {
-		pathParts := strings.Split(serverPath, ".")
-		routesPath := append(pathParts, "routes")
-
-		// Ensure the server path exists
-		ensurePath(config, pathParts)
-
-		// Get the server config
-		current := config
-		for _, part := range pathParts {
-			current = current[part].(map[string]interface{})
-		}
-
-		// Set the routes array
-		current["routes"] = routes
 	}
 
 	if err := iter.Close(); err != nil {
 		caddy.Log().Named("adapters.cql").Error(fmt.Sprintf("Error closing iterator: %v", err))
 		return nil, fmt.Errorf("error fetching config: %w", err)
+	}
+
+	// Insert routes into config
+	for serverPath, routeArray := range routes {
+		current := config
+		parts := strings.Split(serverPath, ".")
+
+		// Navigate to server location
+		for _, part := range parts {
+			if current[part] == nil {
+				current[part] = make(map[string]interface{})
+			}
+			current = current[part].(map[string]interface{})
+		}
+
+		// Set routes array
+		current["routes"] = routeArray
 	}
 
 	// Log final configuration
@@ -365,7 +376,7 @@ func ensurePath(config map[string]interface{}, path []string) {
 
 func setArrayAtPath(config map[string]interface{}, path []string, value []interface{}) {
 	current := config
-	for i, part := range path[:len(path)-1] {
+	for _, part := range path[:len(path)-1] {
 		if next, ok := current[part]; !ok {
 			current[part] = make(map[string]interface{})
 			current = current[part].(map[string]interface{})
