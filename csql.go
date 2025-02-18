@@ -268,8 +268,9 @@ func getConfiguration(configID gocql.UUID) (map[string]interface{}, error) {
 
 	var entry ConfigEntry
 	pathValues := make(map[string]pathValue)
+	routePaths := make(map[string][]string) // Track route paths by server
 
-	// First pass: collect all values
+	// First pass: collect all values and identify route paths
 	for iter.Scan(&entry.Path, &entry.Value, &entry.DataType) {
 		caddy.Log().Named("adapters.cql").Debug(fmt.Sprintf("Processing entry - Path: %s, Type: %s", entry.Path, entry.DataType))
 
@@ -287,6 +288,24 @@ func getConfiguration(configID gocql.UUID) (map[string]interface{}, error) {
 			value:    parsedValue,
 			dataType: entry.DataType,
 		}
+
+		// Track route paths
+		if strings.Contains(entry.Path, ".routes.") {
+			parts := strings.Split(entry.Path, ".routes.")
+			serverPath := parts[0]
+			routePath := "routes." + parts[1]
+			routePaths[serverPath] = append(routePaths[serverPath], routePath)
+		}
+	}
+
+	// Initialize server routes as empty arrays
+	for serverPath := range routePaths {
+		routesPath := serverPath + ".routes"
+		caddy.Log().Named("adapters.cql").Debug(fmt.Sprintf("Initializing routes array for server: %s", routesPath))
+
+		pathParts := strings.Split(routesPath, ".")
+		ensurePath(config, pathParts[:len(pathParts)-1])
+		setArrayAtPath(config, pathParts, []interface{}{})
 	}
 
 	// Second pass: build structure ensuring arrays
@@ -294,28 +313,18 @@ func getConfiguration(configID gocql.UUID) (map[string]interface{}, error) {
 		caddy.Log().Named("adapters.cql").Debug(fmt.Sprintf("Building structure for path: %s", path))
 
 		pathParts := strings.Split(path, ".")
-
-		// Special handling for routes paths
 		if strings.Contains(path, ".routes.") {
-			routesPath := path[:strings.Index(path, ".routes.")] + ".routes"
-			caddy.Log().Named("adapters.cql").Debug(fmt.Sprintf("Special handling for routes path: %s", routesPath))
-
-			baseConfig := make(map[string]interface{})
-			setNestedValue(baseConfig, strings.Split(routesPath, "."), []interface{}{})
-			setNestedValue(config, strings.Split(routesPath, "."), baseConfig[strings.Split(routesPath, ".")[0]])
+			// Handle route entries specially
+			setRouteValue(config, pathParts, pv.value)
+		} else {
+			setNestedValue(config, pathParts, pv.value)
 		}
-
-		setNestedValue(config, pathParts, pv.value)
 	}
 
 	if err := iter.Close(); err != nil {
 		caddy.Log().Named("adapters.cql").Error(fmt.Sprintf("Error closing iterator: %v", err))
 		return nil, fmt.Errorf("error fetching config: %w", err)
 	}
-
-	// Final validation pass
-	caddy.Log().Named("adapters.cql").Debug("Starting final validation pass")
-	ensureArrays(config)
 
 	// Log final configuration
 	finalJSON, _ := json.MarshalIndent(config, "", "  ")
@@ -324,21 +333,77 @@ func getConfiguration(configID gocql.UUID) (map[string]interface{}, error) {
 	return config, nil
 }
 
-// Add this helper function
-func ensureArrays(m map[string]interface{}) {
-	for k, v := range m {
-		switch val := v.(type) {
-		case map[string]interface{}:
-			caddy.Log().Named("adapters.cql").Debug(fmt.Sprintf("Ensuring arrays for map key: %s", k))
-			ensureArrays(val)
-			if k == "routes" {
-				if _, ok := v.([]interface{}); !ok {
-					caddy.Log().Named("adapters.cql").Debug("Converting routes map to array")
-					m[k] = []interface{}{val}
-				}
-			}
+// Add helper functions
+func ensurePath(config map[string]interface{}, path []string) {
+	current := config
+	for _, part := range path {
+		if _, ok := current[part]; !ok {
+			current[part] = make(map[string]interface{})
+		}
+		current = current[part].(map[string]interface{})
+	}
+}
+
+func setArrayAtPath(config map[string]interface{}, path []string, value []interface{}) {
+	current := config
+	for i, part := range path[:len(path)-1] {
+		if next, ok := current[part]; !ok {
+			current[part] = make(map[string]interface{})
+			current = current[part].(map[string]interface{})
+		} else if m, ok := next.(map[string]interface{}); ok {
+			current = m
+		} else {
+			// If it's not a map, create a new one
+			newMap := make(map[string]interface{})
+			current[part] = newMap
+			current = newMap
 		}
 	}
+	current[path[len(path)-1]] = value
+}
+
+func setRouteValue(config map[string]interface{}, path []string, value interface{}) {
+	// Find the routes array in the path
+	routesIdx := -1
+	for i, part := range path {
+		if part == "routes" {
+			routesIdx = i
+			break
+		}
+	}
+
+	if routesIdx == -1 {
+		return
+	}
+
+	// Get the server path and ensure it exists
+	serverPath := path[:routesIdx]
+	ensurePath(config, serverPath)
+
+	// Get or create the routes array
+	current := config
+	for _, part := range serverPath {
+		current = current[part].(map[string]interface{})
+	}
+
+	routesArray, ok := current["routes"].([]interface{})
+	if !ok {
+		routesArray = make([]interface{}, 0)
+		current["routes"] = routesArray
+	}
+
+	// Handle the route index
+	routeIdx, _ := strconv.Atoi(path[routesIdx+1])
+	// Ensure the array is long enough
+	for len(routesArray) <= routeIdx {
+		routesArray = append(routesArray, make(map[string]interface{}))
+	}
+	current["routes"] = routesArray
+
+	// Set the value in the route
+	route := routesArray[routeIdx].(map[string]interface{})
+	setNestedValue(route, path[routesIdx+2:], value)
+	routesArray[routeIdx] = route
 }
 
 func (a Adapter) Adapt(body []byte, options map[string]interface{}) ([]byte, []caddyconfig.Warning, error) {
