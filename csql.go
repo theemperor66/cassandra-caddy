@@ -36,6 +36,17 @@ type CassandraAdapterConfig struct {
 
 var session *gocql.Session
 
+var arrayFields = map[string]bool{
+	"routes":         true,
+	"match":          true,
+	"handle":         true,
+	"listen":         true,
+	"servers":        false, // servers is a map, not an array
+	"Location":       true,  // headers.Location should be an array
+	"host":           true,  // host in match should be an array
+	"contact_points": true,  // storage.contact_points should be an array
+}
+
 type Adapter struct{}
 
 func getSession(config CassandraAdapterConfig) (*gocql.Session, error) {
@@ -84,12 +95,10 @@ func getSession(config CassandraAdapterConfig) (*gocql.Session, error) {
 func parseValue(value string, dataType string) (interface{}, error) {
 	switch dataType {
 	case "string":
-		// Remove any extra quotes that might be present
 		return strings.Trim(value, "\""), nil
 	case "number":
 		var num float64
 		if err := json.Unmarshal([]byte(value), &num); err != nil {
-			// Try parsing the raw string if JSON unmarshal fails
 			if n, err := json.Number(value).Float64(); err == nil {
 				return n, nil
 			}
@@ -99,7 +108,6 @@ func parseValue(value string, dataType string) (interface{}, error) {
 	case "boolean":
 		var b bool
 		if err := json.Unmarshal([]byte(value), &b); err != nil {
-			// Try parsing the raw string if JSON unmarshal fails
 			return value == "true", nil
 		}
 		return b, nil
@@ -113,6 +121,14 @@ func parseValue(value string, dataType string) (interface{}, error) {
 		if err := json.Unmarshal([]byte(value), &result); err != nil {
 			return nil, fmt.Errorf("failed to parse JSON value: %w", err)
 		}
+
+		// If this is an array with a single object, wrap it in an array
+		if arr, ok := result.([]interface{}); ok && len(arr) == 1 {
+			if _, isObj := arr[0].(map[string]interface{}); isObj {
+				// Keep it as an array
+				return arr, nil
+			}
+		}
 		return result, nil
 	default:
 		return nil, fmt.Errorf("unknown data type: %s", dataType)
@@ -122,39 +138,43 @@ func parseValue(value string, dataType string) (interface{}, error) {
 // setNestedValue recursively builds the configuration structure
 func setNestedValue(config map[string]interface{}, path []string, value interface{}) {
 	if len(path) == 1 {
-		// Check if the key should be an array index
-		if i, err := strconv.Atoi(path[0]); err == nil {
-			// If parent is an array, append or set at index
-			if arr, ok := config.([]interface{}); ok {
-				// Extend array if needed
-				for len(arr) <= i {
-					arr = append(arr, nil)
-				}
-				arr[i] = value
-				config = arr
-				return
+		key := path[0]
+		// Check if this field should be an array
+		if arrayFields[key] {
+			// If it's an array field, ensure the value is an array
+			if arr, ok := value.([]interface{}); ok {
+				config[key] = arr
+			} else {
+				// Convert single value to array if needed
+				config[key] = []interface{}{value}
 			}
+			return
 		}
-		config[path[0]] = value
+		config[key] = value
 		return
 	}
 
 	key := path[0]
-	// Check if this key should be an array
-	if i, err := strconv.Atoi(key); err == nil {
-		// This is an array index
-		if config == nil {
-			config = make([]interface{}, i+1)
-		}
-		if arr, ok := config.([]interface{}); ok {
-			// Extend array if needed
+	// Check if the next part is a numeric index
+	if len(path) > 1 {
+		if i, err := strconv.Atoi(path[1]); err == nil {
+			// This is an array path
+			if config[key] == nil {
+				config[key] = make([]interface{}, 0)
+			}
+			arr, ok := config[key].([]interface{})
+			if !ok {
+				arr = make([]interface{}, 0)
+				config[key] = arr
+			}
+			// Ensure array is long enough
 			for len(arr) <= i {
-				arr = append(arr, nil)
+				arr = append(arr, make(map[string]interface{}))
 			}
-			if arr[i] == nil {
-				arr[i] = make(map[string]interface{})
+			config[key] = arr
+			if m, ok := arr[i].(map[string]interface{}); ok {
+				setNestedValue(m, path[2:], value)
 			}
-			setNestedValue(arr[i].(map[string]interface{}), path[1:], value)
 			return
 		}
 	}
