@@ -60,7 +60,7 @@ func getSession(config CassandraAdapterConfig) (*gocql.Session, error) {
 				enabled boolean,
 				last_updated timestamp,
 				PRIMARY KEY (config_id, path)
-			)`
+			) WITH CLUSTERING ORDER BY (path ASC)`
 
 		if err := session.Query(createTableQuery).Exec(); err != nil {
 			caddy.Log().Named("adapters.cql").Error(fmt.Sprintf("Create Table Error: %v", err))
@@ -129,20 +129,15 @@ func setNestedValue(config map[string]interface{}, path []string, value interfac
 func getConfiguration(configID gocql.UUID) (map[string]interface{}, error) {
 	config := make(map[string]interface{})
 
-	// Modified query to only use the partition key (config_id)
+	// Modified query to include enabled in the SELECT and scan
 	iter := session.Query(`
 		SELECT path, value, data_type 
 		FROM caddy_config 
-		WHERE config_id = ?`, configID).Iter()
+		WHERE config_id = ? AND enabled = true 
+		ALLOW FILTERING`, configID).Iter()
 
 	var entry ConfigEntry
 	for iter.Scan(&entry.Path, &entry.Value, &entry.DataType) {
-		// Only process enabled entries in memory instead of in the query
-		// This avoids the ALLOW FILTERING requirement
-		if !entry.Enabled {
-			continue
-		}
-
 		// Parse the value according to its data type
 		parsedValue, err := parseValue(entry.Value, entry.DataType)
 		if err != nil {
