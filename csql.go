@@ -64,7 +64,6 @@ func getSession(config CassandraAdapterConfig) (*gocql.Session, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to create Cassandra session: %w", err)
 	}
-
 	caddy.Log().Named("adapters.cql").Info("Cassandra session established",
 		zap.Strings("hosts", config.Hosts),
 		zap.String("keyspace", config.Keyspace))
@@ -72,8 +71,9 @@ func getSession(config CassandraAdapterConfig) (*gocql.Session, error) {
 }
 
 // parseValue converts a string value to the appropriate Go type based on data_type.
+// For data_type "array", if the value is not valid JSON, it is wrapped in an array.
 func parseValue(value string, dataType string) (interface{}, error) {
-	// Attempt to unquote JSON strings.
+	// Attempt to unquote JSON strings (if the value is quoted).
 	unquoted, unquoteErr := strconv.Unquote(value)
 	if unquoteErr == nil {
 		value = unquoted
@@ -98,10 +98,25 @@ func parseValue(value string, dataType string) (interface{}, error) {
 			return false, nil
 		}
 		return nil, fmt.Errorf("invalid boolean value %q", value)
-	case "array", "object":
+	case "array":
+		var result interface{}
+		// First try to unmarshal as JSON.
+		if err := json.Unmarshal([]byte(value), &result); err != nil {
+			// If unmarshaling fails, assume it's a bare value and wrap it in an array.
+			caddy.Log().Named("adapters.cql").Warn("Failed to unmarshal value as array; wrapping in array",
+				zap.String("value", value),
+				zap.Error(err))
+			wrapped := fmt.Sprintf(`["%s"]`, value)
+			if err2 := json.Unmarshal([]byte(wrapped), &result); err2 != nil {
+				return nil, fmt.Errorf("failed to unmarshal value as array after wrapping: %w", err2)
+			}
+			return result, nil
+		}
+		return result, nil
+	case "object":
 		var result interface{}
 		if err := json.Unmarshal([]byte(value), &result); err != nil {
-			return nil, fmt.Errorf("failed to unmarshal JSON for value %q: %w", value, err)
+			return nil, fmt.Errorf("failed to unmarshal JSON as object: %w", err)
 		}
 		return result, nil
 	default:
