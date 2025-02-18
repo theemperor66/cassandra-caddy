@@ -203,15 +203,15 @@ func getConfiguration(session *gocql.Session) (map[string]interface{}, error) {
 		WHERE enabled = true 
 		ALLOW FILTERING`).Iter()
 
-	var entry ConfigEntry
-	for iter.Scan(&entry.Path, &entry.Value, &entry.DataType) {
-		parsedValue, err := parseValue(entry.Value, entry.DataType)
+	var path, value, dataType string
+	for iter.Scan(&path, &value, &dataType) {
+		parsedValue, err := parseValue(value, dataType)
 		if err != nil {
 			caddy.Log().Named("adapters.cql").Error("parse error", zap.Error(err))
 			continue
 		}
 
-		pathParts := strings.Split(entry.Path, ".")
+		pathParts := strings.Split(path, ".")
 		setNestedValue(config, pathParts, parsedValue)
 	}
 
