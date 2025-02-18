@@ -47,6 +47,14 @@ var arrayFields = map[string]bool{
 	"contact_points": true,  // storage.contact_points should be an array
 }
 
+var arrayPaths = map[string]bool{
+	"apps.http.servers.*.routes":                true,
+	"apps.http.servers.*.routes.*.match":        true,
+	"apps.http.servers.*.routes.*.handle":       true,
+	"apps.http.servers.*.listen":                true,
+	"apps.http.servers.*.routes.*.match.*.host": true,
+}
+
 type Adapter struct{}
 
 func getSession(config CassandraAdapterConfig) (*gocql.Session, error) {
@@ -135,12 +143,54 @@ func parseValue(value string, dataType string) (interface{}, error) {
 	}
 }
 
+// shouldBeArray checks if a field should be an array based on the path
+func shouldBeArray(path string) bool {
+	// Check if the field itself should be an array
+	parts := strings.Split(path, ".")
+	if len(parts) > 0 {
+		lastPart := parts[len(parts)-1]
+		if arrayFields[lastPart] {
+			return true
+		}
+	}
+
+	// Check if the full path (with wildcards) should be an array
+	for pattern, isArray := range arrayPaths {
+		if isArray && matchWildcardPath(pattern, path) {
+			return true
+		}
+	}
+
+	return false
+}
+
+func matchWildcardPath(pattern, path string) bool {
+	patternParts := strings.Split(pattern, ".")
+	pathParts := strings.Split(path, ".")
+
+	if len(patternParts) != len(pathParts) {
+		return false
+	}
+
+	for i := range patternParts {
+		if patternParts[i] == "*" {
+			continue
+		}
+		if patternParts[i] != pathParts[i] {
+			return false
+		}
+	}
+	return true
+}
+
 // setNestedValue recursively builds the configuration structure
 func setNestedValue(config map[string]interface{}, path []string, value interface{}) {
+	fullPath := strings.Join(path, ".")
+
 	if len(path) == 1 {
 		key := path[0]
 		// Check if this field should be an array
-		if arrayFields[key] {
+		if shouldBeArray(fullPath) {
 			// If it's an array field, ensure the value is an array
 			if arr, ok := value.([]interface{}); ok {
 				config[key] = arr
