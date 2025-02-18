@@ -255,6 +255,20 @@ type pathValue struct {
 	dataType string
 }
 
+// Add this helper function to check if a path is a route path
+func isRoutePath(path string) bool {
+	parts := strings.Split(path, ".")
+	for i, part := range parts {
+		if part == "routes" && i < len(parts)-1 {
+			// Check if next part is a number
+			_, err := strconv.Atoi(parts[i+1])
+			return err == nil
+		}
+	}
+	return false
+}
+
+// Update getConfiguration to better handle routes
 func getConfiguration(configID gocql.UUID) (map[string]interface{}, error) {
 	config := make(map[string]interface{})
 
@@ -267,10 +281,9 @@ func getConfiguration(configID gocql.UUID) (map[string]interface{}, error) {
 		ALLOW FILTERING`, configID).Iter()
 
 	var entry ConfigEntry
-	pathValues := make(map[string]pathValue)
-	routePaths := make(map[string][]string) // Track route paths by server
+	routeConfigs := make(map[string][]interface{}) // Store route configurations by server path
 
-	// First pass: collect all values and identify route paths
+	// First pass: collect routes and regular values
 	for iter.Scan(&entry.Path, &entry.Value, &entry.DataType) {
 		caddy.Log().Named("adapters.cql").Debug(fmt.Sprintf("Processing entry - Path: %s, Type: %s", entry.Path, entry.DataType))
 
@@ -280,45 +293,51 @@ func getConfiguration(configID gocql.UUID) (map[string]interface{}, error) {
 			return nil, fmt.Errorf("error parsing value for path %s: %w", entry.Path, err)
 		}
 
-		// Log the parsed value
-		valueJSON, _ := json.Marshal(parsedValue)
-		caddy.Log().Named("adapters.cql").Debug(fmt.Sprintf("Parsed value for %s: %s", entry.Path, string(valueJSON)))
+		pathParts := strings.Split(entry.Path, ".")
 
-		pathValues[entry.Path] = pathValue{
-			value:    parsedValue,
-			dataType: entry.DataType,
-		}
+		if isRoutePath(entry.Path) {
+			// Handle route entry
+			serverPath := entry.Path[:strings.Index(entry.Path, ".routes")]
+			routeIdx, _ := strconv.Atoi(pathParts[len(pathParts)-2]) // Get route index
 
-		// Track route paths
-		if strings.Contains(entry.Path, ".routes.") {
-			parts := strings.Split(entry.Path, ".routes.")
-			serverPath := parts[0]
-			routePath := "routes." + parts[1]
-			routePaths[serverPath] = append(routePaths[serverPath], routePath)
-		}
-	}
+			// Initialize route array if needed
+			if routeConfigs[serverPath] == nil {
+				routeConfigs[serverPath] = make([]interface{}, 0)
+			}
 
-	// Initialize server routes as empty arrays
-	for serverPath := range routePaths {
-		routesPath := serverPath + ".routes"
-		caddy.Log().Named("adapters.cql").Debug(fmt.Sprintf("Initializing routes array for server: %s", routesPath))
+			// Ensure route array is long enough
+			for len(routeConfigs[serverPath]) <= routeIdx {
+				routeConfigs[serverPath] = append(routeConfigs[serverPath], make(map[string]interface{}))
+			}
 
-		pathParts := strings.Split(routesPath, ".")
-		ensurePath(config, pathParts[:len(pathParts)-1])
-		setArrayAtPath(config, pathParts, []interface{}{})
-	}
+			// Get the route object
+			route := routeConfigs[serverPath][routeIdx].(map[string]interface{})
 
-	// Second pass: build structure ensuring arrays
-	for path, pv := range pathValues {
-		caddy.Log().Named("adapters.cql").Debug(fmt.Sprintf("Building structure for path: %s", path))
-
-		pathParts := strings.Split(path, ".")
-		if strings.Contains(path, ".routes.") {
-			// Handle route entries specially
-			setRouteValue(config, pathParts, pv.value)
+			// Set the value in the route
+			setNestedValue(route, pathParts[len(pathParts)-1:], parsedValue)
+			routeConfigs[serverPath][routeIdx] = route
 		} else {
-			setNestedValue(config, pathParts, pv.value)
+			// Handle non-route entry
+			setNestedValue(config, pathParts, parsedValue)
 		}
+	}
+
+	// Second pass: insert route arrays into config
+	for serverPath, routes := range routeConfigs {
+		pathParts := strings.Split(serverPath, ".")
+		routesPath := append(pathParts, "routes")
+
+		// Ensure the server path exists
+		ensurePath(config, pathParts)
+
+		// Get the server config
+		current := config
+		for _, part := range pathParts {
+			current = current[part].(map[string]interface{})
+		}
+
+		// Set the routes array
+		current["routes"] = routes
 	}
 
 	if err := iter.Close(); err != nil {
