@@ -122,15 +122,47 @@ func parseValue(value string, dataType string) (interface{}, error) {
 // setNestedValue recursively builds the configuration structure
 func setNestedValue(config map[string]interface{}, path []string, value interface{}) {
 	if len(path) == 1 {
+		// Check if the key should be an array index
+		if i, err := strconv.Atoi(path[0]); err == nil {
+			// If parent is an array, append or set at index
+			if arr, ok := config.([]interface{}); ok {
+				// Extend array if needed
+				for len(arr) <= i {
+					arr = append(arr, nil)
+				}
+				arr[i] = value
+				config = arr
+				return
+			}
+		}
 		config[path[0]] = value
 		return
 	}
 
 	key := path[0]
+	// Check if this key should be an array
+	if i, err := strconv.Atoi(key); err == nil {
+		// This is an array index
+		if config == nil {
+			config = make([]interface{}, i+1)
+		}
+		if arr, ok := config.([]interface{}); ok {
+			// Extend array if needed
+			for len(arr) <= i {
+				arr = append(arr, nil)
+			}
+			if arr[i] == nil {
+				arr[i] = make(map[string]interface{})
+			}
+			setNestedValue(arr[i].(map[string]interface{}), path[1:], value)
+			return
+		}
+	}
+
+	// Handle regular map
 	if config[key] == nil {
 		config[key] = make(map[string]interface{})
 	}
-
 	if m, ok := config[key].(map[string]interface{}); ok {
 		setNestedValue(m, path[1:], value)
 	}
