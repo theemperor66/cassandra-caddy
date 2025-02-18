@@ -66,6 +66,16 @@ func getSession(config CassandraAdapterConfig) (*gocql.Session, error) {
 			caddy.Log().Named("adapters.cql").Error(fmt.Sprintf("Create Table Error: %v", err))
 			return nil, err
 		}
+
+		// Create index on enabled column
+		createIndexQuery := `
+			CREATE INDEX IF NOT EXISTS caddy_config_enabled_idx 
+			ON caddy_config (enabled)`
+
+		if err := session.Query(createIndexQuery).Exec(); err != nil {
+			caddy.Log().Named("adapters.cql").Error(fmt.Sprintf("Create Index Error: %v", err))
+			return nil, err
+		}
 	}
 	return session, nil
 }
