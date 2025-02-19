@@ -3,10 +3,12 @@ package cassandraadapter
 import (
 	"encoding/json"
 	"fmt"
-	"go.uber.org/zap"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
+
+	"go.uber.org/zap"
 
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/caddyconfig"
@@ -31,6 +33,9 @@ type CassandraAdapterConfig struct {
 	Hosts        []string `json:"contact_points"`
 	Keyspace     string   `json:"keyspace"`
 	QueryTimeout int      `json:"query_timeout"`
+	// Optionally, you can add a PageSize and WorkerCount for tuning:
+	PageSize    int `json:"page_size"`
+	WorkerCount int `json:"worker_count"`
 }
 
 var (
@@ -225,38 +230,73 @@ func setNestedValue(currentMap map[string]interface{}, path []string, value inte
 	}
 }
 
+// rowEntry holds a single row from the Cassandra query.
+type rowEntry struct {
+	path     string
+	value    string
+	dataType string
+}
+
 // getConfiguration retrieves and assembles the configuration from Cassandra.
-func getConfiguration(session *gocql.Session) (map[string]interface{}, error) {
+// It uses paging and a worker pool to process rows concurrently.
+func getConfiguration(session *gocql.Session, pageSize, workerCount int) (map[string]interface{}, error) {
 	config := make(map[string]interface{})
+
 	query := `
 		SELECT path, value, data_type 
 		FROM caddy_config 
-		WHERE enabled = true 
-		ALLOW FILTERING`
-	caddy.Log().Named("adapters.cql").Info("Running Cassandra query", zap.String("query", query))
-	iter := session.Query(query).Iter()
+		WHERE enabled = true`
+	// NOTE: Removing ALLOW FILTERING here. In production, adjust your schema to avoid filtering.
 
+	caddy.Log().Named("adapters.cql").Info("Running Cassandra query", zap.String("query", query))
+	iter := session.Query(query).PageSize(pageSize).Iter()
+
+	// Channel to distribute rows to workers.
+	rowCh := make(chan rowEntry, pageSize)
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+
+	// Launch worker pool.
+	for i := 0; i < workerCount; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for row := range rowCh {
+				// Debug logging at lower level can be enabled for troubleshooting.
+				caddy.Log().Named("adapters.cql").Debug("Processing row",
+					zap.String("path", row.path),
+					zap.String("value", row.value),
+					zap.String("data_type", row.dataType))
+				parsedValue, err := parseValue(row.value, row.dataType)
+				if err != nil {
+					caddy.Log().Named("adapters.cql").Error("Error parsing value",
+						zap.String("path", row.path),
+						zap.String("value", row.value),
+						zap.String("data_type", row.dataType),
+						zap.Error(err))
+					continue
+				}
+				pathParts := strings.Split(row.path, ".")
+				// Lock the configuration while updating the nested value.
+				mu.Lock()
+				setNestedValue(config, pathParts, parsedValue)
+				mu.Unlock()
+			}
+		}()
+	}
+
+	// Feed rows into the channel.
 	var path, value, dataType string
 	for iter.Scan(&path, &value, &dataType) {
-		caddy.Log().Named("adapters.cql").Debug("Processing row",
-			zap.String("path", path),
-			zap.String("value", value),
-			zap.String("data_type", dataType))
-		parsedValue, err := parseValue(value, dataType)
-		if err != nil {
-			caddy.Log().Named("adapters.cql").Error("Error parsing value",
-				zap.String("path", path),
-				zap.String("value", value),
-				zap.String("data_type", dataType),
-				zap.Error(err))
-			continue
-		}
-		pathParts := strings.Split(path, ".")
-		setNestedValue(config, pathParts, parsedValue)
+		rowCh <- rowEntry{path: path, value: value, dataType: dataType}
 	}
+	close(rowCh)
+
 	if err := iter.Close(); err != nil {
 		return nil, fmt.Errorf("query iteration failed: %w", err)
 	}
+
+	wg.Wait()
 
 	caddy.Log().Named("adapters.cql").Info("Successfully built configuration from Cassandra")
 	return config, nil
@@ -272,6 +312,14 @@ func (a Adapter) Adapt(body []byte, options map[string]interface{}) ([]byte, []c
 		return nil, nil, fmt.Errorf("contact_points and keyspace are required in the adapter configuration")
 	}
 
+	// Set default values if not provided.
+	if cfg.PageSize <= 0 {
+		cfg.PageSize = 1000
+	}
+	if cfg.WorkerCount <= 0 {
+		cfg.WorkerCount = 8
+	}
+
 	caddy.Log().Named("adapters.cql").Info("Adapter configuration loaded", zap.Any("config", cfg))
 	session, err := getSession(cfg)
 	if err != nil {
@@ -279,7 +327,7 @@ func (a Adapter) Adapt(body []byte, options map[string]interface{}) ([]byte, []c
 	}
 	defer session.Close()
 
-	caddyConfig, err := getConfiguration(session)
+	caddyConfig, err := getConfiguration(session, cfg.PageSize, cfg.WorkerCount)
 	if err != nil {
 		return nil, nil, err
 	}
